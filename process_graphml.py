@@ -16,6 +16,16 @@ from pagegraph.commands.scripts import Command as ScriptCommand
 # from pagegraph.types import PageGraphId, PageGraphNodeId
 from pagegraph.commands import Result as CommandResult
 
+EDGE_KEYS = [
+        "attr name", "before", "edge type", "headers", "is style",
+        "key", "parent", "resource type", "response hash",
+        "size", "status", "value"
+    ]
+
+NODE_KEYS = [
+    "url", "source", "text", "script type", "method", "tag name", "node type"
+    ]
+
 class SetEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, set):
@@ -135,53 +145,59 @@ def find_script_diff(site, extn='ublock'):
 
 #     return sub_nodes, sub_edges
 
-def compare_node_attrs(attrs1, attrs2):
-    keys = ["url", "source", "text", "script type", "method", "tag name", "node type"]
-    return all(attrs1.get(k) == attrs2.get(k) for k in keys)
+# def compare_node_attrs(attrs1, attrs2):
+#     return all(attrs1.get(k) == attrs2.get(k) for k in NODE_KEYS)
 
 def extract_first_divergent_node(graph1, graph2, root1, root2):
-    visited1 = set()
-    visited2 = set()
-    queue = deque([(root1, root2, 0)])
+    visited = set()
+    queue = deque([(None, root1, root2, 0)])
 
-    def get_node_signature(graph, node_id):
-        attrs = graph.nodes[node_id]
-        return tuple(attrs.get(attr, '') for attr in ["url", "timestamp", "script type", "method", "tag name", "node type"])
-
+    def get_signature(graph, parent, node):
+        node_attrs = graph.nodes[node]
+        edge_attrs = graph.get_edge_data(parent, node, default={}) if parent else {}
+        node_tuple = tuple(node_attrs.get(attr, '') for attr in NODE_KEYS)
+        edge_tuple = tuple(edge_attrs.get(attr, '') for attr in EDGE_KEYS)
+        return (node_tuple, edge_tuple)
 
     while queue:
         # print(len(queue))
-        node1, node2, level = queue.popleft()
+        parent1, parent2, node1, node2, level = queue.popleft()
 
-        if node1 in visited1 or node2 in visited2:
+        if (node1, node2, level) in visited:
             continue
 
-        visited1.add(node1)
-        visited2.add(node2)
+        visited.add((node1, node2, level))
 
-        attrs1 = graph1.nodes[node1]
-        attrs2 = graph2.nodes[node2]
+        sig1 = get_signature(graph1, parent1, node1)
+        sig2 = get_signature(graph2, parent2, node2)
+
+        if sig1 != sig2:
+            return {
+                "level": level,
+                "control_signature": sig1,
+                "adblock_signature": sig2
+            }
 
         # print(attrs1)
         # print('*'*15)
         # print(attrs2)
         # print('*'*50)
 
-        if not compare_node_attrs(attrs1, attrs2):
-            return {
-                "level": level,
-                # "control_node": {k: attrs1.get(k) for k in attrs1},
-                # "adblock_node": {k: attrs2.get(k) for k in attrs2}
-                "control_node": [attrs1.get(attr, '') for attr in ["url", "script type", "method", "tag name", "node type"]],
-                "adblock_node": [attrs2.get(attr, '') for attr in ["url", "script type", "method", "tag name", "node type"]]
-            }
+        # if not compare_node_attrs(attrs1, attrs2):
+        #     return {
+        #         "level": level,
+        #         # "control_node": {k: attrs1.get(k) for k in attrs1},
+        #         # "adblock_node": {k: attrs2.get(k) for k in attrs2}
+        #         "control_node": [attrs1.get(attr, '') for attr in ["url", "script type", "method", "tag name", "node type"]],
+        #         "adblock_node": [attrs2.get(attr, '') for attr in ["url", "script type", "method", "tag name", "node type"]]
+        #     }
 
         children1 = list(graph1.successors(node1))
         children2 = list(graph2.successors(node2))
 
         if len(children1) != len(children2):
-            sigs1 = set(get_node_signature(graph1, c) for c in children1)
-            sigs2 = set(get_node_signature(graph2, c) for c in children2)
+            sigs1 = set(get_signature(graph1, node1, c) for c in children1)
+            sigs2 = set(get_node_signature(graph2, node2,  c) for c in children2)
 
             only_in_adblock = sigs2 - sigs1
             only_in_control = sigs1 - sigs2
@@ -190,14 +206,33 @@ def extract_first_divergent_node(graph1, graph2, root1, root2):
                 "level": level,
                 "control_children_count": len(children1),
                 "adblock_children_count": len(children2),
-                "parent_node": [attrs1.get(attr, '') for attr in ["url", "script type", "method", "tag name", "node type"]],
+                "parent_node": [attrs1.get(attr, '') for attr in NODE_KEYS],
                 "only_in_adblock": only_in_adblock,
-                "only_in_control": only_in_control
-                
+                "only_in_control": only_in_control 
             }
 
-        for c1, c2 in zip(children1, children2):
-            queue.append((c1, c2, level + 1))
+        # for c1, c2 in zip(children1, children2):
+        #     queue.append((c1, c2, level + 1))
+        def get_edge_hash(graph, parent, child):
+            edge_attrs = graph.get_edge_data(parent, child, default={})
+            return hashlib.md5("|".join(str(edge_attrs.get(k, '')) for k in EDGE_KEYS).encode()).hexdigest()
+
+        child_map1 = {get_edge_hash(graph1, node1, c): c for c in children1}
+        child_map2 = {get_edge_hash(graph2, node2, c): c for c in children2}
+
+        common_hashes = set(child_map1.keys()) & set(child_map2.keys())
+        only_ctrl = set(child_map1.keys()) - common_hashes
+        only_adb = set(child_map2.keys()) - common_hashes
+
+        for h in common_hashes:
+            queue.append((node1, node2, child_map1[h], child_map2[h], level + 1))
+
+        if only_ctrl or only_adb:
+            return {
+                "level": level,
+                "unmatched_control_children": [graph1.nodes[child_map1[h]] for h in only_ctrl],
+                "unmatched_adblock_children": [graph2.nodes[child_map2[h]] for h in only_adb]
+            }
 
     return None    
 
